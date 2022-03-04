@@ -14,8 +14,9 @@ import operator
 from typing import Iterator, List, Optional, Union, overload
 
 from _drgn import _linux_helper_read_vm
-from drgn import IntegerLike, Object, Program, cast
+from drgn import FaultError, IntegerLike, Object, Program, Type, cast
 from drgn.helpers import decode_enum_type_flags
+from drgn.helpers.linux.list import list_for_each_entry
 
 __all__ = (
     "access_process_vm",
@@ -30,6 +31,9 @@ __all__ = (
     "pfn_to_virt",
     "virt_to_page",
     "virt_to_pfn",
+    "find_slab",
+    "print_slabs",
+    "get_slab_objects",
 )
 
 
@@ -291,3 +295,104 @@ def environ(task: Object) -> List[bytes]:
     env_start = mm.env_start.value_()
     env_end = mm.env_end.value_()
     return access_remote_vm(mm, env_start, env_end - env_start).split(b"\0")[:-1]
+
+
+def find_slab(prog: Program, slab_name: str) -> Object:
+    """
+    Return the slab object corresponding to slab_name
+
+    :param slab_name: name of the slab
+    :return: ``struct kmem_cache``
+    """
+    slab_caches_addr = prog["slab_caches"].address_of_().read_()
+    for s in list_for_each_entry(
+        "struct kmem_cache", slab_caches_addr, "list"
+    ):
+        if s.name.string_().decode("utf-8") == slab_name:
+            return s
+
+
+def print_slabs(prog: Program):
+    """
+    Print the slab name and the value of each ``struct kmem_cache *`` for all slabs.
+    """
+    slab_caches_addr = prog["slab_caches"].address_of_().read_()
+    for s in list_for_each_entry(
+        "struct kmem_cache", slab_caches_addr, "list"
+    ):
+        print(f"{s.name.string_()} ({s.type_.type_name()})0x{s.value_():x}")
+
+
+def _slub_page_objects(prog: Program, slab: Object, page: Object, obj_type: Type) -> List[Type]:
+    """
+    Get the list of all objects from slub
+
+    :param slab: ``struct kmem_cache``
+    :param page: ``struct page``
+    :param obj_type: type of object contained in the slab
+    """
+    addr = page_to_virt(page).value_()
+    addr += slab.red_left_pad
+    ret = []
+    end = addr + slab.size * page.objects
+    while addr < end:
+        ret.append(Object(prog, obj_type, address=addr))
+        addr += slab.size
+    return ret
+
+
+def slab_page_objects(prog: Program, slab: Object, page: Object, obj_type: Type) -> List[Type]:
+    """
+    Get the list of all objects from a slab page
+
+    :param slab: ``struct kmem_cache``
+    :param page: ``struct page``
+    :param obj_type: type of object contained in the slab
+    """
+    try:
+        return _slub_page_objects(prog, slab, page, obj_type)
+    except AttributeError:
+        pass
+    ret = []
+    offset = 0
+    if prog.type("struct kmem_cache").has_member("obj_offset"):
+        offset = slab.obj_offset
+    for i in range(0, slab.num):
+        addr = page.s_mem.value_() + i * slab.size + offset
+        ret.append(Object(prog, obj_type, address=addr))
+    return ret
+
+
+def for_each_slab_page(prog: Program) -> Iterator[Object]:
+    """
+    Iterate over all slab pages
+
+    :return: Iterator of ``struct page *`` objects.
+    """
+
+    PGSlab = 1 << prog.constant("PG_slab")
+    for p in for_each_page(prog):
+        try:
+            if p.flags.value_() & PGSlab:
+                yield p
+        except FaultError:
+            pass
+
+
+def get_slab_objects(prog: Program, slab: Object, obj_type: Type) -> List[Type]:
+    """
+    Get the list of all objects of a given slab and type
+
+    >>> pid_slab = find_slab(prog, "pid")
+    >>> pid_type = prog.type("struct pid")
+    >>> get_slab_objects(prog, pid_slab, pid_type)
+    [Object(prog, 'struct pid', address=0xffff888c5dcd1e80), Object(prog, 'struct pid', address=0xffff888c5dcd1f80)]
+
+    :param slab: ``struct kmem_cache``
+    :param obj_type: type of object contained in the slab
+    """
+    ret = []
+    for page in for_each_slab_page(prog):
+        if page.slab_cache == slab:
+            ret.extend(slab_page_objects(prog, slab, page, obj_type))
+    return ret

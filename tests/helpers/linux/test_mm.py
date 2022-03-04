@@ -21,6 +21,8 @@ from drgn.helpers.linux.mm import (
     pfn_to_page,
     pfn_to_virt,
     virt_to_pfn,
+    find_slab,
+    get_slab_objects,
 )
 from drgn.helpers.linux.pid import find_task
 from tests.helpers.linux import LinuxHelperTestCase, mlock
@@ -134,3 +136,17 @@ class TestMm(LinuxHelperTestCase):
             proc_environ = f.read().split(b"\0")[:-1]
         task = find_task(self.prog, os.getpid())
         self.assertEqual(environ(task), proc_environ)
+
+    def test_slab(self):
+        with open("/proc/slabinfo", "rb") as f:
+            proc_slabinfo = f.read().split(b"\n")[2:-1]
+            for info in proc_slabinfo:
+                slab_name = info.split()[0].decode("utf-8")
+                slab = find_slab(self.prog, slab_name)
+                self.assertEqual(slab_name, slab.name.string_().decode("utf-8"))
+
+    def test_get_slab_objects(self):
+        type_name = "struct pid"
+        slab = find_slab(self.prog, "pid")
+        type_obj = self.prog.type(type_name)
+        self.assertGreater(len(get_slab_objects(self.prog, slab, type_obj)), 0)
